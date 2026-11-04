@@ -11,7 +11,7 @@ NMS **active looter** slot, and claims it with one click.
 
 | Colour | Meaning | Left click |
 | --- | --- | --- |
-| Green | This character is the active looter (`[NMS] Active looter: you.`) | Nothing |
+| Green | This character is the active looter (`[NMS] Active looter: you.`) | Sends `#nms status` |
 | Red | Someone else holds the slot, or nobody does | Sends `#nms claim` |
 | Grey | No answer from the server yet | Sends `#nms status` |
 
@@ -57,7 +57,9 @@ TAC updates are extracted over the MacroQuest folder and leave `claim_button.lua
 
 ### The button
 
-- **Left click**: see the table above.
+- **Left click**: see the table above. On green or grey a click refreshes the state; clicks while
+  that query waits for its answer, or within 2 seconds of the last query, are ignored, so fast
+  clicking sends a single `#nms status`.
 - **Hover**: a tooltip says who holds the slot and how old that answer is.
 - **Move**: drag the button.
 - **Resize**: drag the bottom-right corner, like any TAC window.
@@ -102,6 +104,7 @@ The panel also shows the current state and has an **Ask now** button.
 | `/ac claimbutton show` / `hide` | Show / hide the button |
 | `/ac claimbutton status` | Ask the server now (`#nms status`) |
 | `/ac claimbutton claim` | Claim the slot (`#nms claim`), same as clicking the red button |
+| `/ac claimbutton debug` | Print the button's state and the last mouse state, for bug reports |
 
 ## Notes
 

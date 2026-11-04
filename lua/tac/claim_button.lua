@@ -6,7 +6,7 @@
 -- *active looter*. This plugin is one button that says whether this
 -- character holds that slot: green when it does, red when someone else or
 -- nobody does, grey until the server has answered. Clicking red types
--- `#nms claim`, clicking grey asks, clicking green does nothing.
+-- `#nms claim`; clicking green or grey asks again (`#nms status`).
 --
 -- The state is read from the server's reply to `#nms status`:
 --   [NMS] Active looter: you.
@@ -26,9 +26,9 @@
 -- The commands and replies still show in chat: MacroQuest Lua can read chat
 -- lines but not hide them, and /filter would hide them from this plugin too.
 --
--- The window has no title bar and the button fills it; dragging the button
+-- The window has no title bar and the button face fills it; dragging it
 -- moves the window. It resizes from the bottom-right grip like every TAC
--- window; the button would cover that grip, so the grip is drawn again on
+-- window; the face would cover that grip, so the grip is drawn again on
 -- top of it. Right-click opens the idle
 -- opacity slider and the shared TAC window items (lock, scale, layout,
 -- close); the Config panel on the Plugins page holds every option.
@@ -76,6 +76,7 @@ local KILL_DELAY_SEC    = 1.0    -- lets the server hand out the kill's loot bef
 local KILL_MIN_GAP_SEC  = 10.0   -- kill queries at most this often; later kills wait for the next slot
 local CLAIM_CONFIRM_SEC = 1.5    -- #nms status this long after #nms claim
 local REPLY_TIMEOUT_SEC = 5.0    -- an unanswered query stops blocking the next one after this
+local CLICK_ASK_GAP_SEC = 2.0    -- a click asks at most this often after the last query
 local IDLE_DELAY_SEC    = 0.5    -- mouse away this long before the window fades
 local FADE_OUT_SEC      = 0.25
 local PENDING_ALPHA     = 0.55   -- button opacity while a claim is being confirmed
@@ -143,7 +144,8 @@ function logic.newState()
         heldAt          = 0,     -- last frame the mouse was over the window or its menu was open
         hovered         = false,
         menuOpen        = false,
-        dragged         = false, -- the button press under way moved the window
+        pressHere       = false, -- the left button went down on the face (not the grip, no menu open)
+        diag            = nil,   -- last frame's input state, for /ac claimbutton debug
         alpha           = 1,
         events          = {},
     }
@@ -260,12 +262,22 @@ function logic.claimPending(s, now)
     return now < confirmAt + REPLY_TIMEOUT_SEC
 end
 
--- What a left click does: 'claim', 'ask', or nil (green, or a claim pending).
+-- What a left click does: 'claim' (red), 'ask' (green or grey: refresh),
+-- or nil while a claim is being confirmed.
 function logic.clickAction(s, now)
     if logic.claimPending(s, now) then return nil end
-    if s.looter == 'me' then return nil end
-    if s.looter == nil then return 'ask' end
+    if s.looter == nil or s.looter == 'me' then return 'ask' end
     return 'claim'
+end
+
+-- A refresh asked by a click. Ignored while a query waits for its reply or
+-- within CLICK_ASK_GAP_SEC of the last one, so fast clicking sends one query
+-- instead of filling the chat. Returns whether a query was queued.
+function logic.askFromClick(s, now)
+    if s.inFlightAt and (now - s.inFlightAt) < REPLY_TIMEOUT_SEC then return false end
+    if s.sentAt and (now - s.sentAt) < CLICK_ASK_GAP_SEC then return false end
+    logic.request(s, 'manual', now)
+    return true
 end
 
 -- Window opacity: 1 while held, then after IDLE_DELAY_SEC down to `idle`
@@ -450,7 +462,7 @@ local function tooltipText(now)
     if logic.claimPending(state, now) then
         line = 'Claiming the active looter slot...'
     elseif state.looter == 'me' then
-        line = 'You are the active looter.'
+        line = 'You are the active looter. Click to refresh.'
     elseif state.looter == 'other' then
         line = 'Active looter: ' .. tostring(state.looterName) .. '. Click to claim.'
     elseif state.looter == 'none' then
@@ -466,7 +478,7 @@ local function onClick(now)
     if action == 'claim' then
         sendClaim(now)
     elseif action == 'ask' then
-        logic.request(state, 'manual', now)
+        logic.askFromClick(state, now)
     end
 end
 
@@ -497,44 +509,53 @@ local function isLocked()
     return o ~= nil and o.lock == true
 end
 
--- The button covers the whole window, so ImGui never sees a press on the
--- window itself and would not let it be dragged. Move it by hand while the
--- button is held and the mouse drags; the click that ends a drag is dropped.
-local function dragWindow(active)
-    if not active or isLocked() then return end
-    local okD, dragging = pcall(ImGui.IsMouseDragging, 0)
-    if not (okD and dragging == true) then return end
-    local okM, a, b = pcall(ImGui.GetMouseDragDelta, 0)
-    if not okM then return end
-    local dx, dy = xy(a, b)
-    if dx == 0 and dy == 0 then return end
-    pcall(ImGui.ResetMouseDragDelta, 0)
-    local x, y = call2(ImGui.GetWindowPosVec or ImGui.GetWindowPos)
-    pcall(ImGui.SetWindowPos, x + dx, y + dy)
-    state.dragged = true
+local function mouseFlag(fn)
+    if not fn then return false end
+    local ok, v = pcall(fn, 0)
+    return ok and v == true
 end
 
--- The bottom-right resize grip, drawn over the button that covers ImGui's
--- own (ImGui still handles the drag: it claims the mouse in that corner
--- before the button does). Same size and colours as ImGui's grip.
-local function drawGrip(alpha)
-    if isLocked() then return end
-    local okDl, dl = pcall(ImGui.GetWindowDrawList)
-    if not okDl or not dl then return end
+-- True once the left button has moved past ImGui's drag threshold since it
+-- went down: that press moved or resized the window, it is not a click.
+local function mouseDragged()
+    local ok, a, b = pcall(ImGui.GetMouseDragDelta, 0)
+    if not ok then return false end
+    local dx, dy = xy(a, b)
+    return dx ~= 0 or dy ~= 0
+end
+
+-- The window rectangle and the size of ImGui's bottom-right resize grip.
+local function windowRect()
     local x, y = call2(ImGui.GetWindowPosVec or ImGui.GetWindowPos)
     local w, h = call2(ImGui.GetWindowSizeVec or ImGui.GetWindowSize)
-    if w <= 0 or h <= 0 then return end
     local okF, font = pcall(ImGui.GetFontSize)
     if not okF or type(font) ~= 'number' then font = 13 end
-    local size = math.min(math.floor(font * 1.35), w, h)
-    local x2, y2 = x + w, y + h
-    local mx, my = call2(ImGui.GetMousePosVec or ImGui.GetMousePos)
-    local over = mx <= x2 and my <= y2 and (x2 - mx) + (y2 - my) <= size
+    return x, y, w, h, math.min(math.floor(font * 1.35), w, h)
+end
+
+local function overGrip(mx, my, x2, y2, size)
+    return mx <= x2 and my <= y2 and (x2 - mx) + (y2 - my) <= size
+end
+
+-- The button face: one rounded rectangle over the whole window, lighter
+-- under the mouse, darker while pressed, dimmed while a claim is pending.
+local function drawFace(dl, x, y, w, h, hovered, pressed, now)
+    local c = COLORS[state.looter or 'unknown']
+    local d = 0
+    if pressed then d = -ACTIVE_DARKEN elseif hovered then d = HOVER_LIGHTEN end
+    local a = state.alpha * (logic.claimPending(state, now) and PENDING_ALPHA or 1)
+    pcall(function()
+        dl:AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), col32(c[1] + d, c[2] + d, c[3] + d, a), frameRounding())
+    end)
+end
+
+-- ImGui's bottom-right resize grip, drawn again over the face that covers
+-- it. ImGui still does the resizing; this only keeps the grip visible, in
+-- ImGui's own size and colours.
+local function drawGrip(dl, x2, y2, size, over, down, alpha)
+    if isLocked() then return end
     local name = 'ResizeGrip'
-    if over then
-        local okD, down = pcall(ImGui.IsMouseDown, 0)
-        name = (okD and down == true) and 'ResizeGripActive' or 'ResizeGripHovered'
-    end
+    if over then name = down and 'ResizeGripActive' or 'ResizeGripHovered' end
     local r, g, b, a = styleColor(name)
     local k = frameRounding() * ARC_DIAGONAL
     -- Clockwise, as ImGui's anti-aliased fill expects.
@@ -557,7 +578,7 @@ end
 -- left out (it fades the frame only, and this window is all content) and so
 -- is the title bar toggle (the window never has one).
 local function drawMenu()
-    if not ImGui.BeginPopupContextItem('##claimButtonMenu') then
+    if not ImGui.BeginPopupContextWindow('##claimButtonMenu') then
         state.menuOpen = false
         return
     end
@@ -572,29 +593,39 @@ local function drawMenu()
     ImGui.EndPopup()
 end
 
+-- The window holds no ImGui button on purpose: an item covering the whole
+-- window holds the mouse, so ImGui could not move the window and the click
+-- had to be told apart from a drag by hand. With no item, ImGui moves and
+-- resizes the window itself (and Lock stops both), and a click is a press
+-- and release inside the window, off the grip, without a drag.
 local function drawContents(now)
-    local w, h = call2(ImGui.GetContentRegionAvail)
-    local c = COLORS[state.looter or 'unknown']
-    local pending = logic.claimPending(state, now)
-    -- The theme frames every button with a 1 px border in its own colour;
-    -- without it the button is one colour edge to edge, hovered or not.
-    ImGui.PushStyleVar(ImGuiStyleVar.FrameBorderSize, 0)
-    if pending then ImGui.PushStyleVar(ImGuiStyleVar.Alpha, state.alpha * PENDING_ALPHA) end
-    ImGui.PushStyleColor(ImGuiCol.Button, c[1], c[2], c[3], 1)
-    ImGui.PushStyleColor(ImGuiCol.ButtonHovered, clamp01(c[1] + HOVER_LIGHTEN), clamp01(c[2] + HOVER_LIGHTEN), clamp01(c[3] + HOVER_LIGHTEN), 1)
-    ImGui.PushStyleColor(ImGuiCol.ButtonActive, clamp01(c[1] - ACTIVE_DARKEN), clamp01(c[2] - ACTIVE_DARKEN), clamp01(c[3] - ACTIVE_DARKEN), 1)
-    local clicked = ImGui.Button('##claimButton', math.max(1, w), math.max(1, h))
-    local hovered = ImGui.IsItemHovered()
-    local active = ImGui.IsItemActive()
-    ImGui.PopStyleColor(3)
-    ImGui.PopStyleVar(pending and 2 or 1)
-    dragWindow(active)
-    if clicked and not state.dragged then onClick(now) end
-    if not active then state.dragged = false end
+    local avW, avH = call2(ImGui.GetContentRegionAvail)
+    -- Keeps the content as big as the window, so a double-click on the grip
+    -- (ImGui's auto-fit) does not shrink it to the minimum size.
+    ImGui.Dummy(math.max(1, avW), math.max(1, avH))
+    local x, y, w, h, gripSize = windowRect()
+    local mx, my = call2(ImGui.GetMousePosVec or ImGui.GetMousePos)
+    local inWindow = windowHovered()
+    local onGrip = inWindow and not isLocked() and overGrip(mx, my, x + w, y + h, gripSize)
+    local hovered = inWindow and not onGrip
+    local down = mouseFlag(ImGui.IsMouseDown)
+    if mouseFlag(ImGui.IsMouseClicked) then state.pressHere = hovered and not state.menuOpen end
+    if mouseFlag(ImGui.IsMouseReleased) then
+        if state.pressHere and hovered and not mouseDragged() then onClick(now) end
+        state.pressHere = false
+    elseif not down then
+        state.pressHere = false
+    end
+    local okDl, dl = pcall(ImGui.GetWindowDrawList)
+    if okDl and dl and w > 0 and h > 0 then
+        drawFace(dl, x, y, w, h, hovered, state.pressHere and down, now)
+        drawGrip(dl, x + w, y + h, gripSize, onGrip, down, state.alpha)
+    end
     drawMenu()
     if hovered and not state.menuOpen then core.setTooltip(tooltipText(now)) end
-    drawGrip(state.alpha)
-    state.hovered = windowHovered()
+    state.hovered = inWindow
+    local okA, anyActive = pcall(ImGui.IsAnyItemActive)
+    state.diag = { at = now, hovered = hovered, onGrip = onGrip, down = down, anyActive = okA and anyActive == true }
 end
 
 local function drawWindow()
@@ -747,7 +778,21 @@ plugin.help = {
     '  \ag/ac claimbutton show | hide\ax - Show / hide it',
     '  \ag/ac claimbutton status\ax - Ask the server who holds the active looter slot (#nms status)',
     '  \ag/ac claimbutton claim\ax - Claim the slot (#nms claim), same as clicking the red button',
+    '  \ag/ac claimbutton debug\ax - Print the button\'s state and last mouse state (for bug reports)',
 }
+
+local function printDebug(now)
+    local d = state.diag
+    say('looter=%s pending=%s visible=%s locked=%s menuOpen=%s pressHere=%s inFlight=%s',
+        tostring(state.looter), tostring(logic.claimPending(state, now)), tostring(isVisible()), tostring(isLocked()),
+        tostring(state.menuOpen), tostring(state.pressHere), tostring(state.inFlightAt ~= nil))
+    if not d then
+        say('No frame drawn yet.')
+        return
+    end
+    say('last frame %s ago: hovered=%s onGrip=%s mouseDown=%s anyItemActive=%s',
+        fmtAge(now - d.at), tostring(d.hovered), tostring(d.onGrip), tostring(d.down), tostring(d.anyActive))
+end
 
 function plugin.onCommand(cmd, args)
     cmd = tostring(cmd or ''):lower()
@@ -772,6 +817,8 @@ function plugin.onCommand(cmd, args)
         else
             sendClaim(now)
         end
+    elseif sub == 'debug' then
+        printDebug(now)
     else
         for _, line in ipairs(plugin.help) do print(line) end
     end

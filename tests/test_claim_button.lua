@@ -197,7 +197,20 @@ eq(logic.clickAction(s, 0), 'claim', 'other: click claims')
 s.looter = 'none'
 eq(logic.clickAction(s, 0), 'claim', 'nobody: click claims')
 s.looter = 'me'
-eq(logic.clickAction(s, 0), nil, 'me: click does nothing')
+eq(logic.clickAction(s, 0), 'ask', 'me: click refreshes')
+
+s = logic.newState()
+eq(logic.askFromClick(s, 10), true, 'a click asks')
+eq(s.due.manual, 10, 'the query is due at once')
+logic.markSent(s, 'manual', 10)
+eq(logic.askFromClick(s, 10.2), false, 'no second query while waiting for the reply')
+logic.applyReply(s, 'me', 'you', 10.3)
+eq(logic.askFromClick(s, 11.9), false, 'no query within 2 s of the last one')
+eq(logic.askFromClick(s, 12), true, 'a click 2 s later asks again')
+s = logic.newState()
+logic.markSent(s, 'poll', 50)
+eq(logic.askFromClick(s, 54.9), false, 'an unanswered query blocks clicks until it times out')
+eq(logic.askFromClick(s, 55), true, 'after the timeout a click asks')
 
 s = logic.newState()
 s.looter = 'other'
@@ -258,14 +271,15 @@ local function enum() return setmetatable({ _n = 0 }, enumMeta) end
 ImGuiCol, ImGuiStyleVar, ImGuiWindowFlags, ImGuiHoveredFlags, ImGuiCond = enum(), enum(), enum(), enum(), enum()
 ImVec2 = function(x, y) return { x = x, y = y } end
 
+-- The window sits at 100,100 and is 60x30; the mouse starts in its middle.
 local ui = { styleVars = 0, styleColors = 0, windows = 0, popups = 0, maxBad = nil,
-             buttonClicked = false, popupOpen = false, hovered = false, triangles = 0, tooltips = {},
-             active = false, dragging = false, dragDelta = { 0, 0 }, movedTo = nil, varValues = {} }
+             popupOpen = false, hovered = false, triangles = 0, faces = 0, tooltips = {},
+             mouse = { x = 130, y = 115, down = false, clicked = false, released = false, dx = 0, dy = 0 } }
 local function bad(msg) ui.maxBad = ui.maxBad or msg end
 ImGui = {
     Begin = function() ui.windows = ui.windows + 1; return true, true end,
     End = function() ui.windows = ui.windows - 1; if ui.windows < 0 then bad('End without Begin') end end,
-    PushStyleVar = function(idx, v) ui.styleVars = ui.styleVars + 1; ui.varValues[idx] = v end,
+    PushStyleVar = function() ui.styleVars = ui.styleVars + 1 end,
     PopStyleVar = function(n) ui.styleVars = ui.styleVars - (n or 1); if ui.styleVars < 0 then bad('PopStyleVar underflow') end end,
     PushStyleColor = function() ui.styleColors = ui.styleColors + 1 end,
     PopStyleColor = function(n) ui.styleColors = ui.styleColors - (n or 1); if ui.styleColors < 0 then bad('PopStyleColor underflow') end end,
@@ -274,22 +288,27 @@ ImGui = {
     GetContentRegionAvail = function() return 60, 30 end,
     GetWindowPos = function() return 100, 100 end,
     GetWindowSize = function() return 60, 30 end,
-    GetMousePos = function() return 0, 0 end,
+    GetMousePos = function() return ui.mouse.x, ui.mouse.y end,
     GetFontSize = function() return 13 end,
     GetStyle = function() return { FrameRounding = 4 } end,
     GetStyleColorVec4 = function() return { x = 0.26, y = 0.59, z = 0.98, w = 0.2 } end,
-    GetWindowDrawList = function() return { AddTriangleFilled = function() ui.triangles = ui.triangles + 1 end } end,
-    Button = function(label) if label == '##claimButton' then local c = ui.buttonClicked; ui.buttonClicked = false; return c end return false end,
+    GetWindowDrawList = function()
+        return {
+            AddTriangleFilled = function() ui.triangles = ui.triangles + 1 end,
+            AddRectFilled = function() ui.faces = ui.faces + 1 end,
+        }
+    end,
+    Dummy = function() end,
+    Button = function() return false end,
     SmallButton = function() return false end,
-    IsItemHovered = function() return ui.hovered end,
-    IsItemActive = function() return ui.active end,
-    IsMouseDragging = function() return ui.dragging end,
-    GetMouseDragDelta = function() return ui.dragDelta[1], ui.dragDelta[2] end,
-    ResetMouseDragDelta = function() ui.dragDelta = { 0, 0 } end,
-    SetWindowPos = function(x, y) ui.movedTo = { x, y } end,
+    IsItemHovered = function() return false end,
+    IsAnyItemActive = function() return false end,
     IsWindowHovered = function() return ui.hovered end,
-    IsMouseDown = function() return false end,
-    BeginPopupContextItem = function() if ui.popupOpen then ui.popups = ui.popups + 1; return true end return false end,
+    IsMouseDown = function() return ui.mouse.down end,
+    IsMouseClicked = function() return ui.mouse.clicked end,
+    IsMouseReleased = function() return ui.mouse.released end,
+    GetMouseDragDelta = function() return ui.mouse.dx, ui.mouse.dy end,
+    BeginPopupContextWindow = function() if ui.popupOpen then ui.popups = ui.popups + 1; return true end return false end,
     EndPopup = function() ui.popups = ui.popups - 1; if ui.popups < 0 then bad('EndPopup without Begin') end end,
     TextDisabled = function() end,
     Separator = function() end,
@@ -348,6 +367,19 @@ end
 
 local function lastCmd() return mqStub.cmds[#mqStub.cmds] end
 
+local function frame() plugin.onDrawUI() end
+
+-- One left click as ImGui delivers it: a frame with the button going down,
+-- then one with it coming up. dx, dy: how far the mouse moved while held.
+local function click(dx, dy)
+    local m = ui.mouse
+    m.down, m.clicked, m.released, m.dx, m.dy = true, true, false, 0, 0
+    frame()
+    m.down, m.clicked, m.released, m.dx, m.dy = false, false, true, dx or 0, dy or 0
+    frame()
+    m.released, m.dx, m.dy = false, 0, 0
+end
+
 -- --------------------------------------------------------------------------
 section('hooks: init, tick, events')
 -- --------------------------------------------------------------------------
@@ -397,67 +429,96 @@ eq(plugin.state.due.zone, 16, 'zone query 5 s after zoning')
 -- --------------------------------------------------------------------------
 section('hooks: drawing')
 -- --------------------------------------------------------------------------
-plugin.onDrawUI()
+frame()
 balanced('idle frame')
+eq(ui.faces, 1, 'button face drawn')
 eq(ui.triangles, 1, 'resize grip drawn')
-eq(ui.varValues[ImGuiStyleVar.FrameBorderSize], 0, 'button drawn without the theme border')
 
 ui.hovered = true
-plugin.onDrawUI()
+frame()
 balanced('hovered frame')
 check(#ui.tooltips > 0 and ui.tooltips[#ui.tooltips]:find('Click to claim', 1, true) ~= nil, 'tooltip offers the claim')
 
-ui.buttonClicked = true
-plugin.onDrawUI()
-balanced('click frame')
+click()
+balanced('click frames')
 eq(lastCmd(), '/say #nms claim', 'click on red claims')
 eq(logic.claimPending(plugin.state, clock), true, 'claim pending after click')
 before = #mqStub.cmds
-ui.buttonClicked = true
-plugin.onDrawUI()
-balanced('pending click frame')
+click()
 eq(#mqStub.cmds, before, 'click while pending does nothing')
 
+-- Rapid clicks on green ask once and leave the button working.
+clock = 20
+plugin.state.looter, plugin.state.claimAt, plugin.state.due = 'me', nil, {}
+before = #mqStub.cmds
+for _ = 1, 20 do
+    click()
+    plugin.onTick()
+end
+balanced('rapid clicks')
+eq(#mqStub.cmds, before + 1, 'rapid clicks on green send one query')
+eq(lastCmd(), '/say #nms status', 'and it is a status query')
+eq(plugin.state.pressHere, false, 'no press left over after rapid clicks')
+plugin.state.looter = 'other'
+click()
+eq(#mqStub.cmds, before + 2, 'the button still claims after rapid clicks')
+eq(lastCmd(), '/say #nms claim', 'and it sent a claim')
+plugin.state.claimAt = nil
+
+before = #mqStub.cmds
+click(5, 3)
+eq(#mqStub.cmds, before, 'a press that drags the window is no click')
+
+ui.mouse.x, ui.mouse.y = 158, 128
+click()
+eq(#mqStub.cmds, before, 'a press on the resize grip is no click')
+ui.mouse.x, ui.mouse.y = 130, 115
+
+ui.hovered = false
+ui.mouse.down, ui.mouse.clicked = true, true
+frame()
+ui.hovered = true
+ui.mouse.down, ui.mouse.clicked, ui.mouse.released = false, false, true
+frame()
+ui.mouse.released = false
+eq(#mqStub.cmds, before, 'a press that started outside the window is no click')
+
 ui.popupOpen = true
-plugin.onDrawUI()
+frame()
 balanced('menu frame')
 eq(#menuCalls, 1, 'shared TAC menu items drawn')
 eq(menuCalls[1] and menuCalls[1].key, 'claim_button', 'menu items for this window')
 eq(menuCalls[1] and menuCalls[1].opts.ghost, false, 'ghost left out')
 eq(menuCalls[1] and menuCalls[1].opts.titleBar, false, 'title bar toggle left out')
 eq(plugin.state.menuOpen, true, 'menu keeps the window opaque')
+click()
+eq(#mqStub.cmds, before, 'the click that closes the menu is no click')
 ui.popupOpen = false
-
--- Drag the (still red) button: the window follows and the release is no click.
-clock = 30
-plugin.state.claimAt = nil
-before = #mqStub.cmds
-ui.active, ui.dragging, ui.dragDelta = true, true, { 5, 3 }
-plugin.onDrawUI()
-balanced('drag frame')
-eq(ui.movedTo and (ui.movedTo[1] .. ',' .. ui.movedTo[2]), '105,103', 'drag moves the window')
-ui.active, ui.dragging, ui.buttonClicked = false, false, true
-plugin.onDrawUI()
-eq(#mqStub.cmds, before, 'release after a drag does not claim')
-eq(plugin.state.dragged, false, 'drag state cleared on release')
+frame()
 
 windowOpts.claim_button = { lock = true }
-ui.triangles, ui.movedTo = 0, nil
-ui.active, ui.dragging, ui.dragDelta = true, true, { 5, 3 }
-plugin.onDrawUI()
+ui.triangles = 0
+frame()
 balanced('locked frame')
 eq(ui.triangles, 0, 'no grip while locked')
-eq(ui.movedTo, nil, 'locked window does not move')
-ui.active, ui.dragging = false, false
-plugin.onDrawUI()
+ui.mouse.x, ui.mouse.y = 158, 128
+click()
+eq(#mqStub.cmds, before + 1, 'locked: the corner is part of the button')
+plugin.state.claimAt = nil
+ui.mouse.x, ui.mouse.y = 130, 115
 windowOpts.claim_button = nil
 
-plugin.state.looter = 'me'
-plugin.state.claimAt = nil
+clock = 25
+plugin.state.looter, plugin.state.due = 'me', {}
 before = #mqStub.cmds
-ui.buttonClicked = true
-plugin.onDrawUI()
-eq(#mqStub.cmds, before, 'click on green does nothing')
+click()
+plugin.onTick()
+eq(#mqStub.cmds, before + 1, 'click on green refreshes')
+eq(lastCmd(), '/say #nms status', 'with a status query')
+clock = 25.5
+click()
+plugin.onTick()
+eq(#mqStub.cmds, before + 1, 'a second click while it waits sends nothing')
 ui.hovered = false
 
 plugin.onDrawSettings()
@@ -476,7 +537,13 @@ eq(core.ctrl.show_claim_button, true, 'toggle shows')
 plugin.onCommand('ClaimButton', { 'ClaimButton', 'status' })
 eq(plugin.state.due.manual, clock, 'status asks now')
 plugin.onCommand('claimbutton', { 'claimbutton', 'nonsense' })
+local printed = {}
+print = function(s) printed[#printed + 1] = tostring(s) end
+plugin.onCommand('claimbutton', { 'claimbutton', 'debug' })
 print = oldPrint
+local debugText = table.concat(printed, '\n')
+check(debugText:find('pressHere=false', 1, true) ~= nil, 'debug prints the press state')
+check(debugText:find('mouseDown=false', 1, true) ~= nil, 'debug prints the last mouse state')
 plugin.onDrawUI()
 balanced('after commands')
 
